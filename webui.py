@@ -33,6 +33,8 @@ from datetime import timedelta
 import glob
 import webbrowser
 import socket
+import numpy as np
+from scipy.io.wavfile import write
 
 from styletts2.utils import *
 from modules.tortoise_dataset_tools.dataset_whisper_tools.dataset_maker_large_files import *
@@ -44,6 +46,15 @@ GENERATE_SETTINGS = {}
 TRAINING_DIR = "training"
 BASE_CONFIG_FILE_PATH = r"Configs\template_config_ft.yml"
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v1", "large-v2", "large-v3"]
+VALID_AUDIO_EXT = [
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".aac",
+    ".ogg",
+    ".m4a",
+    ".opus"
+]
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -53,9 +64,10 @@ model_params = None
 sampler = None
 textcleaner = None
 to_mel = None
+params_whole = None
 
 def load_all_models(model_path):
-    global global_phonemizer, model, model_params, sampler, textcleaner, to_mel
+    global global_phonemizer, model, model_params, sampler, textcleaner, to_mel, params_whole
     
     model_config = (get_model_configuration(model_path))
     if not model_config:
@@ -74,8 +86,60 @@ def load_all_models(model_path):
     to_mel = torchaudio.transforms.MelSpectrogram(
         n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
     
-    load_pretrained_model(model, model_path=model_path)
+    params_whole = load_pretrained_model(model, model_path=model_path)
     return False
+
+def unload_all_models():
+    global global_phonemizer, model, model_params, sampler, textcleaner, to_mel, params_whole
+
+    if global_phonemizer:
+        del global_phonemizer
+        global_phonemizer = None
+        print("Unloaded phonemizer")
+
+    if model:
+        del model
+        model = None
+        print("Unloaded model")
+
+    if model_params:
+        del model_params
+        model_params = None
+        print("Unloaded model params")
+
+    if sampler:
+        del sampler
+        sampler = None
+        print("Unloaded sampler")
+
+    if textcleaner:
+        del textcleaner
+        textcleaner = None
+        print("Unloaded textcleaner")
+
+    if to_mel:
+        del to_mel
+        to_mel = None
+        print("Unloaded to_mel")
+
+    if params_whole:
+        del params_whole
+        params_whole = None
+        print("Unloaded params_whole")
+
+    do_gc()
+    torch.cuda.empty_cache()
+
+    gr.Info("All models unloaded.")
+
+def do_gc():
+    # garbage collection - useful in combination with torch.cuda.empty_cache to clear out gpu when unloading models
+    import gc
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception as e:
+        pass
     
 def get_file_path(root_path, voice, file_extension, error_message):
     model_path = os.path.join(root_path, voice)
@@ -113,16 +177,22 @@ def generate_audio(text, voice, reference_audio_file, seed, alpha, beta, diffusi
     set_seeds(seed_value)
     for k, path in reference_dicts.items():
         mean, std = -4, 4
+        print(f'model:{model}')
         ref_s = compute_style(path, model, to_mel, mean, std, device)
+
+        texts = split_and_recombine_text(text)
+        audios = []
         
-        wav1 = inference(text, ref_s, model, sampler, textcleaner, to_mel, device, model_params, global_phonemizer=global_phonemizer, alpha=alpha, beta=beta, diffusion_steps=diffusion_steps, embedding_scale=embedding_scale)
+        # wav1 = inference(text, ref_s, model, sampler, textcleaner, to_mel, device, model_params, global_phonemizer=global_phonemizer, alpha=alpha, beta=beta, diffusion_steps=diffusion_steps, embedding_scale=embedding_scale)
+        for t in texts:
+            audios.append(inference(t, ref_s, model, sampler, textcleaner, to_mel, device, model_params, global_phonemizer=global_phonemizer, alpha=alpha, beta=beta, diffusion_steps=diffusion_steps, embedding_scale=embedding_scale))
+
         rtf = (time.time() - start)
         print(f"RTF = {rtf:5f}")
         print(f"{k} Synthesized:")
-        from scipy.io.wavfile import write
         os.makedirs("results", exist_ok=True)
         audio_opt_path = os.path.join("results", f"{voice}_output.wav")
-        write(audio_opt_path, 24000, wav1)
+        write(audio_opt_path, 24000, np.concatenate(audios))
     
     # Save the settings after generation
     save_settings({
@@ -296,7 +366,11 @@ def load_whisper_model(language=None, model_name=None, progress=None):
         device = "cuda" 
     else:
         raise gr.Error("Non-Nvidia GPU detected, or CUDA not available")
-    whisper_model = whisperx.load_model(model_name, device, download_root="whisper_models")
+    try:
+        whisper_model = whisperx.load_model(model_name, device, download_root="whisper_models", compute_type="float16")
+    except Exception as e: # for older GPUs
+        print(f"Debugging info: {e}")
+        whisper_model = whisperx.load_model(model_name, device, download_root="whisper_models", compute_type="int8")
     # whisper_align_model = whisperx.load_align_model(model_name="WAV2VEC2_ASR_LARGE_LV60K_960H" if language=="en" else None, language_code=language, device=device)
     print("Loaded Whisper model")
     return whisper_model
@@ -339,13 +413,13 @@ def transcribe_other_language_proxy(voice, language, chunk_size, continuation_di
 
     from modules.tortoise_dataset_tools.audio_conversion_tools.split_long_file import get_duration, process_folder
     chosen_directory = os.path.join("./datasets", voice)
-    items = os.listdir(chosen_directory)
-    
+    items = [item for item in os.listdir(chosen_directory) if os.path.splitext(item)[1].lower() in VALID_AUDIO_EXT]
+
     # This is to prevent an error below when processing "non audio" files.  This will occur with other types, but .pth should
     # be the only other ones in the voices folder.
-    for file in items:
-        if file.endswith(".pth"):
-            items.remove(file)
+    # for file in items:
+    #     if file.endswith(".pth"):
+    #         items.remove(file)
     
     # In case of sudden restart, removes this intermediary file used for rename
     for file in items:
@@ -602,7 +676,7 @@ def main():
                                     label="Audio Extension", value="wav", choices=["wav", "mp3"]
                                 )
                                 DATASET_SETTINGS["speaker_id"] = gr.Checkbox(
-                                    label="Speaker ID", value=True
+                                    label="Speaker ID", value=True, visible=False
                                 )
                             transcribe2_button = gr.Button(
                                 value="Transcribe and Process")
@@ -797,6 +871,10 @@ def main():
                 refresh_models_available_button.click(fn=update_models,
                                                       outputs=GENERATE_SETTINGS["voice_model"]
                 )
+                unload_all_models_button = gr.Button(
+                        value="Unload all loaded models")
+                
+                unload_all_models_button.click(fn=unload_all_models)
                 
                 GENERATE_SETTINGS["voice_model"].change(fn=update_voice_model,
                                 inputs=[GENERATE_SETTINGS["voice_model"]])
@@ -827,7 +905,7 @@ def main():
                 break
     
     webbrowser.open(f"http://localhost:{webui_port}")
-    demo.launch()
+    demo.launch(server_port=webui_port)
 
 if __name__ == "__main__":
     main()

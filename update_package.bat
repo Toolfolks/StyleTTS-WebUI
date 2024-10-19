@@ -28,6 +28,8 @@ git submodule update --remote
 cd ..
 
 xcopy StyleTTS-WebUI\update_package.bat update_package.bat /E /I /H 
+xcopy StyleTTS-WebUI\launch_tensorboard.bat launch_tensorboard.bat /E /I /H 
+xcopy StyleTTS-WebUI\requirements.txt requirements.txt /E /I /H 
 
 xcopy StyleTTS-WebUI\webui.py webui.py /H
 xcopy StyleTTS-WebUI\modules\tortoise_dataset_tools modules\tortoise_dataset_tools /E /I /H
@@ -36,6 +38,7 @@ xcopy StyleTTS-WebUI\modules\StyleTTS2 modules\StyleTTS2 /E /I /H
 
 runtime\python.exe -m pip uninstall StyleTTS2
 runtime\python.exe -m pip install modules\StyleTTS2
+runtime\python.exe -m pip install -r requirements.txt
 
 @echo ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 @echo ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
